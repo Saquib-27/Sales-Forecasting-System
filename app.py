@@ -45,6 +45,9 @@ selected_products = st.sidebar.multiselect("Select Products", products, default=
 min_date, max_date = data['Date'].min(), data['Date'].max()
 selected_dates = st.sidebar.date_input("Select Date Range", [min_date, max_date])
 
+# Aggregation choice (for trend only, Prophet always monthly)
+agg_choice = st.sidebar.radio("Aggregation Level (Trend Only)", ["Daily", "Weekly", "Monthly"], index=1)
+
 # --- Filter Data ---
 filtered_data = data[
     (data['Region'] == selected_region) &
@@ -57,11 +60,21 @@ if filtered_data.empty:
     st.warning("No data available for this selection.")
     st.stop()
 
+# --- Aggregate Data for Trend ---
+if agg_choice == "Weekly":
+    filtered_data = filtered_data.groupby(
+        [pd.Grouper(key="Date", freq="W"), "Product"]
+    )["Sales"].sum().reset_index()
+elif agg_choice == "Monthly":
+    filtered_data = filtered_data.groupby(
+        [pd.Grouper(key="Date", freq="M"), "Product"]
+    )["Sales"].sum().reset_index()
+
 # --- Dashboard Header ---
 st.markdown(f"<h1 style='text-align:center; color:#1abc9c;'>📊 Sales Dashboard: {selected_region}</h1>", unsafe_allow_html=True)
-st.write(f"Products: {', '.join(selected_products)} | Date Range: {selected_dates[0]} to {selected_dates[1]}")
+st.write(f"Products: {', '.join(selected_products)} | Date Range: {selected_dates[0]} to {selected_dates[1]} | Aggregation (Trend): {agg_choice}")
 
-# --- Mini KPI Cards with Sparklines ---
+# --- Product KPIs ---
 st.subheader("📌 Product-wise KPIs")
 for product in selected_products:
     prod_data = filtered_data[filtered_data['Product'] == product].sort_values('Date')
@@ -69,13 +82,11 @@ for product in selected_products:
     avg = prod_data['Sales'].mean()
     max_val = prod_data['Sales'].max()
     
-    # Sparkline figure
-    spark_fig = px.line(prod_data, x='Date', y='Sales', height=80, width=250, line_shape='linear', color_discrete_sequence=[trend_color])
-    spark_fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False)
-    )
+    # Sparkline with rolling mean
+    prod_data["Smooth"] = prod_data["Sales"].rolling(3).mean()
+    spark_fig = px.line(prod_data, x='Date', y='Smooth', height=80, width=250, line_shape='linear',
+                        color_discrete_sequence=[trend_color])
+    spark_fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), xaxis=dict(visible=False), yaxis=dict(visible=False))
     
     col1, col2 = st.columns([1,3])
     with col1:
@@ -83,47 +94,84 @@ for product in selected_products:
     with col2:
         st.plotly_chart(spark_fig, use_container_width=True)
 
-# --- Interactive Sales Trend Chart ---
+# --- Sales Trend Chart ---
 st.subheader("📈 Sales Trend")
 fig_trend = px.line(
-    filtered_data, 
-    x='Date', 
-    y='Sales', 
-    color='Product',
-    title="Sales Trend by Product",
+    filtered_data, x="Date", y="Sales", color="Product",
+    title=f"Sales Trend by Product ({agg_choice})",
     markers=True,
-    hover_data={'Date':True, 'Sales':True, 'Product':True},
+    hover_data={"Date": True, "Sales": True, "Product": True},
     color_discrete_sequence=px.colors.qualitative.Set2
 )
-fig_trend.update_traces(mode='lines+markers', hovertemplate='Date: %{x}<br>Sales: %{y}<br>Product: %{customdata[2]}')
 st.plotly_chart(fig_trend, use_container_width=True)
 
-# --- Prophet Forecast ---
-st.subheader("🔮 Sales Forecast (Next 3 Months)")
-df_forecast = filtered_data.groupby('Date')['Sales'].sum().reset_index().rename(columns={'Date':'ds', 'Sales':'y'})
+# --- Prophet Forecast (Always Monthly) ---
+st.subheader("🔮 Sales Forecast (Next 6 Months)")
 
-if len(df_forecast) < 3:
-    st.info("Not enough data to forecast. Showing trend line instead.")
-    st.line_chart(df_forecast.set_index('ds')['y'])
+# Aggregate sales monthly for forecast
+monthly_data = filtered_data.groupby(
+    pd.Grouper(key="Date", freq="M")
+)["Sales"].sum().reset_index().rename(columns={"Date": "ds", "Sales": "y"})
+
+if len(monthly_data) < 6:
+    st.info("Not enough monthly data to forecast. Showing trend line instead.")
+    st.line_chart(monthly_data.set_index('ds')['y'])
 else:
     model = Prophet()
-    model.fit(df_forecast)
-    
-    future = model.make_future_dataframe(periods=3, freq='M')
+    model.fit(monthly_data)
+
+    # Forecast next 6 months
+    future = model.make_future_dataframe(periods=6, freq="M")
     forecast = model.predict(future)
-    
-    fig_forecast = px.line(
-        forecast, 
-        x='ds', 
-        y='yhat', 
-        title="Forecast with Confidence Interval",
-        hover_data={'yhat':True, 'yhat_upper':True, 'yhat_lower':True},
-        color_discrete_sequence=[forecast_color]
+
+    # --- Custom Forecast Plot ---
+    import plotly.graph_objects as go
+    fig_forecast = go.Figure()
+
+    # Confidence Interval (Shaded)
+    fig_forecast.add_trace(go.Scatter(
+        x=forecast['ds'],
+        y=forecast['yhat_upper'],
+        mode='lines',
+        line=dict(width=0),
+        showlegend=False
+    ))
+    fig_forecast.add_trace(go.Scatter(
+        x=forecast['ds'],
+        y=forecast['yhat_lower'],
+        mode='lines',
+        line=dict(width=0),
+        fill='tonexty',
+        fillcolor='rgba(255,0,0,0.2)',
+        name='Confidence Interval'
+    ))
+
+    # Forecast Line
+    fig_forecast.add_trace(go.Scatter(
+        x=forecast['ds'], y=forecast['yhat'],
+        mode='lines',
+        line=dict(color=forecast_color, width=2),
+        name='Forecast'
+    ))
+
+    # Actual Sales
+    fig_forecast.add_trace(go.Scatter(
+        x=monthly_data['ds'], y=monthly_data['y'],
+        mode='markers+lines',
+        marker=dict(color='blue', size=6, opacity=0.8),
+        line=dict(color='blue', width=1, dash="dot"),
+        name='Actual Sales'
+    ))
+
+    # Layout
+    fig_forecast.update_layout(
+        title="Monthly Sales Forecast with Confidence Interval",
+        xaxis_title="Date (Monthly)",
+        yaxis_title="Sales",
+        template="plotly_white",
+        legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center")
     )
-    fig_forecast.add_scatter(x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(dash='dash', color='red'), name='Upper')
-    fig_forecast.add_scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(dash='dash', color='red'), name='Lower')
-    fig_forecast.add_scatter(x=df_forecast['ds'], y=df_forecast['y'], mode='markers', name='Actual Sales', hovertemplate='Date: %{x}<br>Sales: %{y}')
-    
+
     st.plotly_chart(fig_forecast, use_container_width=True)
 
 # --- Download Filtered Data ---
